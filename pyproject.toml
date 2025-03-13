@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dnasecure"
-version = "1.0.0"
+version = "0.0.1"
 authors = [
     {name = "SelfPower Team", email = "lordrichado@gmail.com"},
 ]

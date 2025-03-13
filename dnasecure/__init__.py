@@ -21,4 +21,4 @@ from .core import (
     DEFAULT_SECURITY_LEVEL
 )
 
-__version__ = '1.0.0'
+__version__ = '0.0.1'
