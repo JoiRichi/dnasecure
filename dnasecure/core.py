@@ -30,8 +30,8 @@ NUM_TO_BASE = {1: 'A', 2: 'C', 3: 'G', 4: 'T', 5: 'N'}
 # Number of values to remove for security (key size)
 DEFAULT_SECURITY_LEVEL = 5
 
-# Maximum chunk size for large sequences (to avoid overflow)
-MAX_CHUNK_SIZE = 10000  # Only chunk sequences larger than 10,000 bases
+# Default chunk size for large sequences (to avoid overflow)
+DEFAULT_CHUNK_SIZE = 10000  # Default chunk size is 10,000 bases
 
 def dna_to_number(sequence: str) -> int:
     """
@@ -79,21 +79,22 @@ def number_to_dna(number: int, length: int = None) -> str:
         
     return ''.join(sequence)
 
-def encrypt_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL) -> Tuple[bytes, List[Tuple[int, int]]]:
+def encrypt_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL, chunk_size: int = DEFAULT_CHUNK_SIZE) -> Tuple[bytes, List[Tuple[int, int]]]:
     """
     Encrypt a DNA sequence using secure self-power decomposition.
-    For large sequences (>10,000 bases), splits into chunks to avoid overflow.
+    For large sequences (>chunk_size bases), splits into chunks to avoid overflow.
     
     Args:
         sequence: DNA sequence string
         num_removed: Number of values to remove for the key
+        chunk_size: Maximum size of each chunk for large sequences
         
     Returns:
         Tuple of (encrypted data, removed values)
     """
     # Check if sequence is too large and needs chunking
-    if len(sequence) > MAX_CHUNK_SIZE:
-        return encrypt_large_sequence(sequence, num_removed)
+    if len(sequence) > chunk_size:
+        return encrypt_large_sequence(sequence, num_removed, chunk_size)
     
     # Convert DNA to number
     number = dna_to_number(sequence)
@@ -107,19 +108,20 @@ def encrypt_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL) -
     
     return encoded_data, removed_values
 
-def encrypt_large_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL) -> Tuple[bytes, List[Tuple[int, int]]]:
+def encrypt_large_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL, chunk_size: int = DEFAULT_CHUNK_SIZE) -> Tuple[bytes, List[Tuple[int, int]]]:
     """
     Encrypt a large DNA sequence by splitting it into chunks.
     
     Args:
         sequence: DNA sequence string
         num_removed: Number of values to remove for the key
+        chunk_size: Maximum size of each chunk
         
     Returns:
         Tuple of (encrypted data, removed values)
     """
     # Split the sequence into chunks
-    chunks = [sequence[i:i+MAX_CHUNK_SIZE] for i in range(0, len(sequence), MAX_CHUNK_SIZE)]
+    chunks = [sequence[i:i+chunk_size] for i in range(0, len(sequence), chunk_size)]
     num_chunks = len(chunks)
     
     # Encrypt each chunk
@@ -131,9 +133,8 @@ def encrypt_large_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LE
         number = dna_to_number(chunk)
         
         # Encrypt using secure self-power decomposition
-        # Use fewer removed values for each chunk to keep key size reasonable
-        chunk_num_removed = max(1, num_removed // num_chunks)
-        encoded_data, removed_values = secure_encode_number_no_placeholder(number, chunk_num_removed)
+        # Use the full security level for each chunk to maintain security
+        encoded_data, removed_values = secure_encode_number_no_placeholder(number, num_removed)
         
         chunk_data.append(encoded_data)
         chunk_keys.append(removed_values)
@@ -213,15 +214,30 @@ def decrypt_large_sequence(encoded_data: bytes, chunk_keys: List[Tuple[int, List
     # Decrypt each chunk
     decrypted_chunks = []
     
+    # Determine the actual chunk size used during encryption
+    # If expected_length is provided and there are multiple chunks, we can estimate the chunk size
+    actual_chunk_size = DEFAULT_CHUNK_SIZE
+    if expected_length is not None and num_chunks > 1:
+        # Estimate the chunk size based on the expected length and number of chunks
+        # This assumes all chunks except possibly the last one are of equal size
+        actual_chunk_size = (expected_length + num_chunks - 1) // num_chunks
+    
     for i in range(num_chunks):
         if i in key_map:
             # Decrypt the chunk
             number = secure_decode_number_no_placeholder(chunks_data[i], key_map[i])
             
             # Convert number back to DNA
-            chunk_length = MAX_CHUNK_SIZE if i < num_chunks - 1 else None
-            chunk = number_to_dna(number, chunk_length)
+            # Only set chunk_length for non-last chunks
+            chunk_length = None
+            if i < num_chunks - 1 and expected_length is not None:
+                # Calculate how many bases should be in this chunk
+                chunk_length = min(actual_chunk_size, expected_length - i * actual_chunk_size)
+                if chunk_length <= 0:
+                    # We've already reached the expected length, no need to process more chunks
+                    break
             
+            chunk = number_to_dna(number, chunk_length)
             decrypted_chunks.append(chunk)
         else:
             raise ValueError(f"Missing key for chunk {i}")
@@ -231,7 +247,7 @@ def decrypt_large_sequence(encoded_data: bytes, chunk_keys: List[Tuple[int, List
     
     # Trim to expected length if provided
     if expected_length and len(sequence) > expected_length:
-        sequence = sequence[-expected_length:]
+        sequence = sequence[:expected_length]
     
     return sequence
 
@@ -240,13 +256,13 @@ def _encrypt_sequence_worker(args):
     Worker function for parallel sequence encryption.
     
     Args:
-        args: Tuple of (sequence, num_removed)
+        args: Tuple of (sequence, num_removed, chunk_size)
         
     Returns:
         Tuple of (encoded_data, removed_values)
     """
-    sequence, num_removed = args
-    return encrypt_sequence(sequence, num_removed)
+    sequence, num_removed, chunk_size = args
+    return encrypt_sequence(sequence, num_removed, chunk_size)
 
 def _decrypt_sequence_worker(args):
     """
@@ -261,7 +277,7 @@ def _decrypt_sequence_worker(args):
     encoded_data, removed_values, expected_length = args
     return decrypt_sequence(encoded_data, removed_values, expected_length)
 
-def encrypt_fasta(input_fasta: str, output_spd: str, output_key: str, num_removed: int = DEFAULT_SECURITY_LEVEL, parallel: bool = True, num_processes: int = None) -> None:
+def encrypt_fasta(input_fasta: str, output_spd: str, output_key: str, num_removed: int = DEFAULT_SECURITY_LEVEL, parallel: bool = True, num_processes: int = None, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
     """
     Encrypt a FASTA file to SPD format with a separate key file.
     
@@ -272,6 +288,7 @@ def encrypt_fasta(input_fasta: str, output_spd: str, output_key: str, num_remove
         num_removed: Number of values to remove for the key
         parallel: Whether to use parallel processing for multiple sequences
         num_processes: Number of processes to use (defaults to number of CPU cores)
+        chunk_size: Maximum size of each chunk for large sequences
     """
     # Read sequences from FASTA file
     sequences = []
@@ -299,7 +316,7 @@ def encrypt_fasta(input_fasta: str, output_spd: str, output_key: str, num_remove
         print(f"Using {num_processes} processes to encrypt {len(sequences)} sequences")
         
         # Prepare arguments for each sequence
-        args = [(sequences[i], num_removed) for i in range(len(sequences))]
+        args = [(sequences[i], num_removed, chunk_size) for i in range(len(sequences))]
         
         # Process sequences in parallel
         with multiprocessing.Pool(processes=num_processes) as pool:
@@ -311,7 +328,7 @@ def encrypt_fasta(input_fasta: str, output_spd: str, output_key: str, num_remove
     else:
         # Sequential processing
         for sequence in sequences:
-            encoded_data, removed_values = encrypt_sequence(sequence, num_removed)
+            encoded_data, removed_values = encrypt_sequence(sequence, num_removed, chunk_size)
             encrypted_data.append(encoded_data)
             all_removed_values.append(removed_values)
     

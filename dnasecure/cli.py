@@ -16,6 +16,7 @@ from dnasecure import (
     encrypt_fasta,
     decrypt_fasta,
     DEFAULT_SECURITY_LEVEL,
+    DEFAULT_CHUNK_SIZE,
     __version__
 )
 
@@ -57,6 +58,12 @@ def parse_args(args: List[str] = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_SECURITY_LEVEL,
         help=f"Number of values to remove for security (default: {DEFAULT_SECURITY_LEVEL})"
+    )
+    encrypt_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help=f"Maximum size of each chunk for large sequences (default: {DEFAULT_CHUNK_SIZE})"
     )
     encrypt_parser.add_argument(
         "--parallel",
@@ -128,7 +135,8 @@ def main(args: List[str] = None) -> int:
                 parsed_args.output_key,
                 parsed_args.security_level,
                 parallel=parsed_args.parallel,
-                num_processes=parsed_args.num_processes
+                num_processes=parsed_args.num_processes,
+                chunk_size=parsed_args.chunk_size
             )
             print(f"Encrypted data saved to {parsed_args.output_spd}")
             print(f"Key saved to {parsed_args.output_key}")

@@ -18,7 +18,8 @@ from .core import (
     decrypt_sequence,
     dna_to_number,
     number_to_dna,
-    DEFAULT_SECURITY_LEVEL
+    DEFAULT_SECURITY_LEVEL,
+    DEFAULT_CHUNK_SIZE
 )
 
-__version__ = '0.0.1'
+__version__ = '0.0.2'
