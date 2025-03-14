@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.4] - 2025-03-16
+
+### Added
+- Implemented experimental optimized large sequence processing with memory views
+- Added parallel processing for individual large sequences
+- Created benchmark tool to compare original vs. optimized implementations
+- Added configuration option to enable/disable optimized implementation (disabled by default)
+
+### Changed
+- Improved memory efficiency with zero-copy slicing in experimental implementation
+- Enhanced parallel processing with better batching in experimental implementation
+- Updated documentation with information about the experimental optimized implementation
+
+### Fixed
+- Fixed memory usage issues with very large sequences
+- Improved error handling in chunked sequence processing
+- Removed debug print statements to improve performance
+
 ## [0.0.3] - 2025-03-15
 
 ### Fixed

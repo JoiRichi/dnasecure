@@ -14,7 +14,13 @@ import numpy as np
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
+import sys
+import functools
+from itertools import islice
+import pickle
 
+
+sys.set_int_max_str_digits(0)
 # Import from the updated selfpowerdecomposer
 from selfpowerdecomposer import (
     secure_encode_number_no_placeholder,
@@ -33,56 +39,58 @@ DEFAULT_SECURITY_LEVEL = 5
 # Default chunk size for large sequences (to avoid overflow)
 DEFAULT_CHUNK_SIZE = 10000  # Default chunk size is 10,000 bases
 
+# Default number of processes for parallel processing
+DEFAULT_PROCS = multiprocessing.cpu_count()
+
+# Flag to use optimized implementation (default: False)
+USE_OPTIMIZED_IMPLEMENTATION = False
+
+# Precompute struct formats for optimized implementation
+CHUNK_HEADER = struct.Struct('<I')
+
+# Precompute lookup tables for maximum speed
+_BASE_TO_NUM_LOOKUP = [5] * 256
+for char, val in [('A', 1), ('a', 1), ('C', 2), ('c', 2),
+                  ('G', 3), ('g', 3), ('T', 4), ('t', 4),
+                  ('N', 5), ('n', 5)]:
+    _BASE_TO_NUM_LOOKUP[ord(char)] = val
+
+_NUM_TO_BASE_LIST = ['', 'A', 'C', 'G', 'T', 'N']
+
+
 def dna_to_number(sequence: str) -> int:
-    """
-    Convert a DNA sequence to a single large integer.
-    Each base is represented as a digit in base-6 (A=1, C=2, G=3, T=4, N=5).
-    
-    Args:
-        sequence: DNA sequence string (ACGTN)
-        
-    Returns:
-        Integer representation of the sequence
-    """
-    number = 0
-    for base in sequence:
-        number = number * 6 + BASE_TO_NUM.get(base.upper(), 5)  # Default to N (5) for unknown bases
-    return number
+    """Convert DNA sequence to a number using optimized lookup and reduce."""
+    lookup = _BASE_TO_NUM_LOOKUP  # Local variable for speed
+    return functools.reduce(lambda x, c: x * 6 + lookup[c],
+                            map(ord, sequence), 0)
+
 
 def number_to_dna(number: int, length: int = None) -> str:
-    """
-    Convert a number back to a DNA sequence.
-    
-    Args:
-        number: Integer representation of the sequence
-        length: Expected length of the sequence (if known)
-        
-    Returns:
-        DNA sequence string
-    """
-    sequence = []
-    
+    """Convert number back to DNA using list comprehensions and preallocated lookups."""
+    num_to_base = _NUM_TO_BASE_LIST  # Local variable for speed
+    if number == 0:
+        return 'A' * length if length else ''
+
+    digits = []
     while number > 0:
-        base_num = number % 6
-        if base_num == 0:  # Skip 0, as our mapping starts from 1
-            number //= 6
-            continue
-        sequence.append(NUM_TO_BASE[base_num])
-        number //= 6
-    
-    # Reverse the sequence (since we built it backwards)
-    sequence.reverse()
-    
-    # Pad with 'A's if length is specified
-    if length and len(sequence) < length:
-        sequence = ['A'] * (length - len(sequence)) + sequence
-        
-    return ''.join(sequence)
+        number, rem = divmod(number, 6)
+        digits.append(rem)
+
+    digits.reverse()
+    if length is not None:
+        pad = length - len(digits)
+        if pad > 0:
+            digits = [1] * pad + digits  # 1 corresponds to 'A'
+
+    return ''.join(num_to_base[d] for d in digits)
+
+
+
 
 def encrypt_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL, chunk_size: int = DEFAULT_CHUNK_SIZE) -> Tuple[bytes, List[Tuple[int, int]]]:
     """
     Encrypt a DNA sequence using secure self-power decomposition.
-    For large sequences (>chunk_size bases), splits into chunks to avoid overflow.
+    For large sequences (>chunk_size bases), splits into chunks to avoid slow decomposition.
     
     Args:
         sequence: DNA sequence string
@@ -92,23 +100,25 @@ def encrypt_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL, c
     Returns:
         Tuple of (encrypted data, removed values)
     """
+    # Special case for empty sequences
+    if not sequence:
+        # Return a special marker for empty sequences
+        return b'\x02', [(0, 0)]  # Flag 2 for empty sequence
+    
     # Check if sequence is too large and needs chunking
     if len(sequence) > chunk_size:
+        print(f"Sequence length ({len(sequence):,} bases) exceeds chunk size ({chunk_size:,} bases), splitting into chunks...")
         return encrypt_large_sequence(sequence, num_removed, chunk_size)
     
     # Convert DNA to number
     number = dna_to_number(sequence)
-    print(f"[DEBUG] Original sequence: {sequence}")
-    print(f"[DEBUG] Converted number: {number}")
     
     # Encrypt using secure self-power decomposition
     encoded_data, removed_values = secure_encode_number_no_placeholder(number, num_removed)
-    print(f"[DEBUG] Encrypted data size: {len(encoded_data)}")
-    print(f"[DEBUG] Removed values: {removed_values}")
     
     return encoded_data, removed_values
 
-def encrypt_large_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL, chunk_size: int = DEFAULT_CHUNK_SIZE) -> Tuple[bytes, List[Tuple[int, int]]]:
+def encrypt_large_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL, chunk_size: int = DEFAULT_CHUNK_SIZE) -> Tuple[bytes, List[Tuple[int, List[Tuple[int, int]]]]]:
     """
     Encrypt a large DNA sequence by splitting it into chunks.
     
@@ -118,42 +128,29 @@ def encrypt_large_sequence(sequence: str, num_removed: int = DEFAULT_SECURITY_LE
         chunk_size: Maximum size of each chunk
         
     Returns:
-        Tuple of (encrypted data, removed values)
+        Tuple of (encrypted data, chunked keys)
     """
-    # Split the sequence into chunks
+    # Split sequence into chunks
     chunks = [sequence[i:i+chunk_size] for i in range(0, len(sequence), chunk_size)]
-    num_chunks = len(chunks)
+    total_chunks = len(chunks)
+    print(f"Splitting sequence into {total_chunks:,} chunks of max size {chunk_size:,} bases")
     
     # Encrypt each chunk
-    chunk_data = []
-    chunk_keys = []
+    encrypted_chunks = []
+    chunked_keys = []
     
-    for chunk in chunks:
-        # Convert DNA to number
+    for i, chunk in enumerate(chunks):
+        print(f"Encrypting chunk {i+1}/{total_chunks} ({len(chunk):,} bases)...")
         number = dna_to_number(chunk)
-        
-        # Encrypt using secure self-power decomposition
-        # Use the full security level for each chunk to maintain security
-        encoded_data, removed_values = secure_encode_number_no_placeholder(number, num_removed)
-        
-        chunk_data.append(encoded_data)
-        chunk_keys.append(removed_values)
+        encrypted_chunk, removed_values = secure_encode_number_no_placeholder(number, num_removed)
+        encrypted_chunks.append(encrypted_chunk)
+        chunked_keys.append((len(chunk), removed_values))
     
-    # Combine the encrypted data
-    # Format: [num_chunks (4 bytes)] + [chunk1_size (4 bytes) + chunk1_data] + [chunk2_size (4 bytes) + chunk2_data] + ...
-    combined_data = struct.pack('<I', num_chunks)
+    # Combine encrypted chunks
+    combined_data = combine_encrypted_chunks(encrypted_chunks)
+    print(f"Encryption complete. Total encrypted data size: {len(combined_data):,} bytes")
     
-    for data in chunk_data:
-        combined_data += struct.pack('<I', len(data))
-        combined_data += data
-    
-    # Store chunk keys with their indices
-    # Format: [(chunk_index, key_values)]
-    combined_keys = []
-    for i, key in enumerate(chunk_keys):
-        combined_keys.append((i, key))
-    
-    return combined_data, combined_keys
+    return combined_data, chunked_keys
 
 def decrypt_sequence(encoded_data: bytes, removed_values: List[Tuple[int, int]], expected_length: int = None) -> str:
     """
@@ -168,88 +165,182 @@ def decrypt_sequence(encoded_data: bytes, removed_values: List[Tuple[int, int]],
     Returns:
         Decrypted DNA sequence
     """
+    # Special case for empty sequences
+    if encoded_data == b'\x02' and removed_values == [(0, 0)]:
+        return ""
+    
     # Check if this is a chunked sequence
     if len(encoded_data) >= 4 and isinstance(removed_values, list) and len(removed_values) > 0 and isinstance(removed_values[0], tuple) and len(removed_values[0]) == 2 and isinstance(removed_values[0][0], int) and isinstance(removed_values[0][1], list):
+        print(f"Detected chunked sequence, processing chunks...")
         return decrypt_large_sequence(encoded_data, removed_values, expected_length)
     
     # Decrypt using secure self-power decomposition
     number = secure_decode_number_no_placeholder(encoded_data, removed_values)
-    print(f"[DEBUG] Decrypted number: {number}")
     
     # Convert number back to DNA
     sequence = number_to_dna(number, expected_length)
-    print(f"[DEBUG] Decrypted sequence: {sequence}")
     
     return sequence
 
-def decrypt_large_sequence(encoded_data: bytes, chunk_keys: List[Tuple[int, List[Tuple[int, int]]]], expected_length: int = None) -> str:
+def decrypt_large_sequence(encoded_data: bytes, chunked_keys: List[Tuple[int, List[Tuple[int, int]]]], expected_length: int = None) -> str:
     """
     Decrypt a large DNA sequence that was split into chunks.
     
     Args:
-        encoded_data: Encrypted sequence data
-        chunk_keys: List of (chunk_index, key_values) tuples
+        encoded_data: Combined encrypted data
+        chunked_keys: List of (chunk_length, removed_values) for each chunk
         expected_length: Expected length of the original sequence
         
     Returns:
         Decrypted DNA sequence
     """
-    # Read the number of chunks
-    num_chunks = struct.unpack('<I', encoded_data[:4])[0]
+    # Split encoded data back into chunks
+    encrypted_chunks = split_encrypted_chunks(encoded_data)
+    total_chunks = len(chunked_keys)
+    print(f"Processing {total_chunks:,} encrypted chunks...")
     
-    # Extract each chunk's data
-    chunks_data = []
-    pos = 4
-    
-    for _ in range(num_chunks):
-        chunk_size = struct.unpack('<I', encoded_data[pos:pos+4])[0]
-        pos += 4
-        chunk_data = encoded_data[pos:pos+chunk_size]
-        pos += chunk_size
-        chunks_data.append(chunk_data)
-    
-    # Create a mapping of chunk index to key
-    key_map = {idx: key for idx, key in chunk_keys}
+    if len(encrypted_chunks) != len(chunked_keys):
+        raise ValueError(f"Number of encrypted chunks ({len(encrypted_chunks)}) doesn't match number of keys ({len(chunked_keys)})")
     
     # Decrypt each chunk
     decrypted_chunks = []
     
-    # Determine the actual chunk size used during encryption
-    # If expected_length is provided and there are multiple chunks, we can estimate the chunk size
-    actual_chunk_size = DEFAULT_CHUNK_SIZE
-    if expected_length is not None and num_chunks > 1:
-        # Estimate the chunk size based on the expected length and number of chunks
-        # This assumes all chunks except possibly the last one are of equal size
-        actual_chunk_size = (expected_length + num_chunks - 1) // num_chunks
+    for i, (encrypted_chunk, (chunk_length, removed_values)) in enumerate(zip(encrypted_chunks, chunked_keys)):
+        print(f"Decrypting chunk {i+1}/{total_chunks}...")
+        number = secure_decode_number_no_placeholder(encrypted_chunk, removed_values)
+        chunk = number_to_dna(number, chunk_length)
+        decrypted_chunks.append(chunk)
     
-    for i in range(num_chunks):
-        if i in key_map:
-            # Decrypt the chunk
-            number = secure_decode_number_no_placeholder(chunks_data[i], key_map[i])
-            
-            # Convert number back to DNA
-            # Only set chunk_length for non-last chunks
-            chunk_length = None
-            if i < num_chunks - 1 and expected_length is not None:
-                # Calculate how many bases should be in this chunk
-                chunk_length = min(actual_chunk_size, expected_length - i * actual_chunk_size)
-                if chunk_length <= 0:
-                    # We've already reached the expected length, no need to process more chunks
-                    break
-            
-            chunk = number_to_dna(number, chunk_length)
-            decrypted_chunks.append(chunk)
-        else:
-            raise ValueError(f"Missing key for chunk {i}")
-    
-    # Combine the decrypted chunks
-    sequence = ''.join(decrypted_chunks)
+    # Combine decrypted chunks
+    decrypted_sequence = ''.join(decrypted_chunks)
+    print(f"Decryption complete. Recovered sequence length: {len(decrypted_sequence):,} bases")
     
     # Trim to expected length if provided
-    if expected_length and len(sequence) > expected_length:
-        sequence = sequence[:expected_length]
+    if expected_length is not None and len(decrypted_sequence) > expected_length:
+        decrypted_sequence = decrypted_sequence[:expected_length]
     
-    return sequence
+    return decrypted_sequence
+
+# Optimized chunking using itertools
+def _chunk_iter(sequence, chunk_size):
+    """
+    Efficiently chunk a sequence using itertools.
+    
+    Args:
+        sequence: The sequence to chunk
+        chunk_size: Size of each chunk
+        
+    Returns:
+        Iterator of chunks
+    """
+    it = iter(sequence)
+    return iter(lambda: ''.join(islice(it, chunk_size)), '')
+
+# Optimized worker functions
+def _encrypt_sequence_worker_optimized(args):
+    """
+    Optimized worker function for parallel sequence encryption.
+    
+    Args:
+        args: Tuple of (chunk, num_removed, chunk_size)
+        
+    Returns:
+        Tuple of (encoded_data, removed_values)
+    """
+    chunk, num_removed, chunk_size = args
+    number = dna_to_number(chunk)
+    encoded_data, removed_values = secure_encode_number_no_placeholder(number, num_removed)
+    return encoded_data, removed_values
+
+def _decrypt_sequence_worker_optimized(args):
+    """
+    Optimized worker function for parallel sequence decryption.
+    
+    Args:
+        args: Tuple of (chunk_data, key, expected_length)
+        
+    Returns:
+        Decrypted sequence
+    """
+    chunk_data, key, expected_length = args
+    number = secure_decode_number_no_placeholder(chunk_data, key)
+    return number_to_dna(number, expected_length)
+
+def encrypt_large_sequence_optimized(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL, chunk_size: int = DEFAULT_CHUNK_SIZE) -> Tuple[bytes, List[Tuple[int, List[Tuple[int, int]]]]]:
+    """
+    Optimized version of encrypt_large_sequence using itertools for chunking.
+    
+    Args:
+        sequence: DNA sequence string
+        num_removed: Number of values to remove for the key
+        chunk_size: Maximum size of each chunk
+        
+    Returns:
+        Tuple of (encrypted data, chunked keys)
+    """
+    # Calculate total number of chunks
+    total_length = len(sequence)
+    total_chunks = (total_length + chunk_size - 1) // chunk_size
+    print(f"Splitting sequence into {total_chunks:,} chunks of max size {chunk_size:,} bases")
+    
+    # Create an iterator that yields chunks of the sequence
+    chunks_iter = (sequence[i:i+chunk_size] for i in range(0, total_length, chunk_size))
+    
+    # Encrypt each chunk
+    encrypted_chunks = []
+    chunked_keys = []
+    
+    for i, chunk in enumerate(chunks_iter):
+        print(f"Encrypting chunk {i+1}/{total_chunks} ({len(chunk):,} bases)...")
+        number = dna_to_number(chunk)
+        encrypted_chunk, removed_values = secure_encode_number_no_placeholder(number, num_removed)
+        encrypted_chunks.append(encrypted_chunk)
+        chunked_keys.append((len(chunk), removed_values))
+    
+    # Combine encrypted chunks
+    combined_data = combine_encrypted_chunks(encrypted_chunks)
+    print(f"Encryption complete. Total encrypted data size: {len(combined_data):,} bytes")
+    
+    return combined_data, chunked_keys
+
+def decrypt_large_sequence_optimized(encoded_data: bytes, chunked_keys: List[Tuple[int, List[Tuple[int, int]]]], expected_length: int = None) -> str:
+    """
+    Optimized version of decrypt_large_sequence.
+    
+    Args:
+        encoded_data: Combined encrypted data
+        chunked_keys: List of (chunk_length, removed_values) for each chunk
+        expected_length: Expected length of the original sequence
+        
+    Returns:
+        Decrypted DNA sequence
+    """
+    # Split encoded data back into chunks
+    encrypted_chunks = split_encrypted_chunks(encoded_data)
+    total_chunks = len(chunked_keys)
+    print(f"Processing {total_chunks:,} encrypted chunks...")
+    
+    if len(encrypted_chunks) != len(chunked_keys):
+        raise ValueError(f"Number of encrypted chunks ({len(encrypted_chunks)}) doesn't match number of keys ({len(chunked_keys)})")
+    
+    # Decrypt each chunk
+    decrypted_chunks = []
+    
+    for i, (encrypted_chunk, (chunk_length, removed_values)) in enumerate(zip(encrypted_chunks, chunked_keys)):
+        print(f"Decrypting chunk {i+1}/{total_chunks}...")
+        number = secure_decode_number_no_placeholder(encrypted_chunk, removed_values)
+        chunk = number_to_dna(number, chunk_length)
+        decrypted_chunks.append(chunk)
+    
+    # Combine decrypted chunks
+    decrypted_sequence = ''.join(decrypted_chunks)
+    print(f"Decryption complete. Recovered sequence length: {len(decrypted_sequence):,} bases")
+    
+    # Trim to expected length if provided
+    if expected_length is not None and len(decrypted_sequence) > expected_length:
+        decrypted_sequence = decrypted_sequence[:expected_length]
+    
+    return decrypted_sequence
 
 def _encrypt_sequence_worker(args):
     """
@@ -277,305 +368,279 @@ def _decrypt_sequence_worker(args):
     encoded_data, removed_values, expected_length = args
     return decrypt_sequence(encoded_data, removed_values, expected_length)
 
+def combine_encrypted_chunks(encrypted_chunks: List[bytes]) -> bytes:
+    """
+    Combine multiple encrypted chunks into a single byte string.
+    
+    Args:
+        encrypted_chunks: List of encrypted chunk data
+        
+    Returns:
+        Combined data with format: [num_chunks (4 bytes)] + [chunk1_size (4 bytes) + chunk1_data] + ...
+    """
+    num_chunks = len(encrypted_chunks)
+    combined_data = struct.pack('<I', num_chunks)
+    
+    for data in encrypted_chunks:
+        combined_data += struct.pack('<I', len(data))
+        combined_data += data
+    
+    return combined_data
+
+def split_encrypted_chunks(combined_data: bytes) -> List[bytes]:
+    """
+    Split combined encrypted data back into individual chunks.
+    
+    Args:
+        combined_data: Combined encrypted data
+        
+    Returns:
+        List of individual encrypted chunks
+    """
+    # Read the number of chunks
+    num_chunks = struct.unpack('<I', combined_data[:4])[0]
+    
+    # Extract each chunk's data
+    chunks_data = []
+    pos = 4
+    
+    for _ in range(num_chunks):
+        chunk_size = struct.unpack('<I', combined_data[pos:pos+4])[0]
+        pos += 4
+        chunk_data = combined_data[pos:pos+chunk_size]
+        pos += chunk_size
+        chunks_data.append(chunk_data)
+    
+    return chunks_data
+
 def encrypt_fasta(input_fasta: str, output_spd: str, output_key: str, num_removed: int = DEFAULT_SECURITY_LEVEL, parallel: bool = True, num_processes: int = None, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
     """
-    Encrypt a FASTA file to SPD format with a separate key file.
+    Encrypt a FASTA file using secure self-power decomposition.
     
     Args:
         input_fasta: Path to input FASTA file
-        output_spd: Path to output SPD file
+        output_spd: Path to output encrypted file
         output_key: Path to output key file
         num_removed: Number of values to remove for the key
-        parallel: Whether to use parallel processing for multiple sequences
-        num_processes: Number of processes to use (defaults to number of CPU cores)
+        parallel: Whether to use parallel processing for large sequences
+        num_processes: Number of processes to use for parallel processing
         chunk_size: Maximum size of each chunk for large sequences
     """
-    # Read sequences from FASTA file
+    print(f"Reading FASTA file: {input_fasta}")
     sequences = []
-    seq_lengths = []
-    seq_ids = []
-    seq_descriptions = []
+    headers = []
     
-    with open(input_fasta, 'r') as fasta_file:
-        for record in SeqIO.parse(fasta_file, "fasta"):
-            sequences.append(str(record.seq))
-            seq_lengths.append(len(record.seq))
-            seq_ids.append(record.id)
-            seq_descriptions.append(record.description)
+    with open(input_fasta, 'r') as f:
+        current_header = None
+        current_sequence = []
+        
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+                
+            if line.startswith('>'):
+                # Save the previous sequence if it exists
+                if current_header is not None:
+                    headers.append(current_header)
+                    sequences.append(''.join(current_sequence))
+                
+                # Start a new sequence
+                current_header = line[1:]  # Remove the '>' character
+                current_sequence = []
+            else:
+                # Add to the current sequence
+                current_sequence.append(line)
+        
+        # Save the last sequence if it exists
+        if current_header is not None:
+            headers.append(current_header)
+            sequences.append(''.join(current_sequence))
+    
+    print(f"Found {len(sequences)} sequences in FASTA file")
     
     # Encrypt each sequence
-    encrypted_data = []
-    all_removed_values = []
+    encrypted_data_list = []
+    removed_values_list = []
     
-    # Use parallel processing if enabled and there are multiple sequences
-    if parallel and len(sequences) > 1:
-        # Determine number of processes
-        if num_processes is None:
-            num_processes = min(multiprocessing.cpu_count(), len(sequences))
+    for i, (header, sequence) in enumerate(zip(headers, sequences)):
+        print(f"Encrypting sequence {i+1}/{len(sequences)}: {header} ({len(sequence):,} bases)")
         
-        print(f"Using {num_processes} processes to encrypt {len(sequences)} sequences")
+        # Encrypt the sequence
+        if parallel and len(sequence) > chunk_size:
+            encrypted_data, removed_values = encrypt_large_sequence(sequence, num_removed, chunk_size)
+        else:
+            encrypted_data, removed_values = encrypt_sequence(sequence, num_removed, chunk_size)
         
-        # Prepare arguments for each sequence
-        args = [(sequences[i], num_removed, chunk_size) for i in range(len(sequences))]
-        
-        # Process sequences in parallel
-        with multiprocessing.Pool(processes=num_processes) as pool:
-            results = pool.map(_encrypt_sequence_worker, args)
-            
-            # Collect results
-            encrypted_data = [result[0] for result in results]
-            all_removed_values = [result[1] for result in results]
-    else:
-        # Sequential processing
-        for sequence in sequences:
-            encoded_data, removed_values = encrypt_sequence(sequence, num_removed, chunk_size)
-            encrypted_data.append(encoded_data)
-            all_removed_values.append(removed_values)
+        encrypted_data_list.append(encrypted_data)
+        removed_values_list.append(removed_values)
     
-    # Write encrypted data to SPD file
+    # Save the encrypted data
+    print(f"Saving encrypted data to: {output_spd}")
     with open(output_spd, 'wb') as f:
-        # Write header
-        f.write(b'DNASP001')  # Magic number and version
-        f.write(struct.pack('<I', len(sequences)))  # Number of sequences
+        # Write the number of sequences
+        f.write(struct.pack('<I', len(sequences)))
         
-        # Write sequence metadata
-        for i in range(len(sequences)):
-            # Write sequence ID and description
-            id_bytes = seq_ids[i].encode('utf-8')
-            desc_bytes = seq_descriptions[i].encode('utf-8')
+        # Write each header and encrypted data
+        for header, encrypted_data in zip(headers, encrypted_data_list):
+            # Write the header length and header
+            header_bytes = header.encode('utf-8')
+            f.write(struct.pack('<I', len(header_bytes)))
+            f.write(header_bytes)
             
-            f.write(struct.pack('<I', len(id_bytes)))
-            f.write(id_bytes)
-            
-            f.write(struct.pack('<I', len(desc_bytes)))
-            f.write(desc_bytes)
-            
-            # Write sequence length
-            f.write(struct.pack('<I', seq_lengths[i]))
-            
-            # Write encrypted data
-            f.write(struct.pack('<I', len(encrypted_data[i])))
-            f.write(encrypted_data[i])
+            # Write the encrypted data length and data
+            f.write(struct.pack('<I', len(encrypted_data)))
+            f.write(encrypted_data)
     
-    # Write key data to key file
+    # Save the removed values (key)
+    print(f"Saving encryption key to: {output_key}")
     with open(output_key, 'wb') as f:
-        # Write header
-        f.write(b'DNAKY001')  # Magic number and version
-        f.write(struct.pack('<I', len(sequences)))  # Number of sequences
-        
-        # Write removed values for each sequence
-        for i in range(len(sequences)):
-            # Write sequence ID
-            id_bytes = seq_ids[i].encode('utf-8')
-            f.write(struct.pack('<I', len(id_bytes)))
-            f.write(id_bytes)
-            
-            # Create a temporary file for the removed values
-            fd, temp_file = tempfile.mkstemp(suffix='.tmp')
-            os.close(fd)
-            
-            try:
-                # Serialize the removed values
-                # For chunked sequences, we need to serialize the chunk keys differently
-                if isinstance(all_removed_values[i], list) and len(all_removed_values[i]) > 0 and isinstance(all_removed_values[i][0], tuple) and len(all_removed_values[i][0]) == 2 and isinstance(all_removed_values[i][0][0], int) and isinstance(all_removed_values[i][0][1], list):
-                    # This is a chunked sequence
-                    with open(temp_file, 'wb') as temp:
-                        # Write a flag indicating this is a chunked sequence
-                        temp.write(b'CHUNK001')
-                        
-                        # Write the number of chunks
-                        temp.write(struct.pack('<I', len(all_removed_values[i])))
-                        
-                        # Write each chunk's key
-                        for chunk_idx, chunk_key in all_removed_values[i]:
-                            # Write chunk index
-                            temp.write(struct.pack('<I', chunk_idx))
-                            
-                            # Create a nested temporary file for the chunk key
-                            fd_chunk, chunk_temp_file = tempfile.mkstemp(suffix='.tmp')
-                            os.close(fd_chunk)
-                            
-                            try:
-                                # Save chunk key to temporary file
-                                save_removed_info_no_placeholder(chunk_key, chunk_temp_file)
-                                
-                                # Read the chunk key file and write its contents
-                                with open(chunk_temp_file, 'rb') as chunk_temp:
-                                    chunk_key_data = chunk_temp.read()
-                                    temp.write(struct.pack('<I', len(chunk_key_data)))
-                                    temp.write(chunk_key_data)
-                            finally:
-                                # Clean up the chunk temporary file
-                                if os.path.exists(chunk_temp_file):
-                                    os.remove(chunk_temp_file)
-                else:
-                    # This is a regular sequence
-                    save_removed_info_no_placeholder(all_removed_values[i], temp_file)
-                
-                # Read the temporary file and write its contents to the key file
-                with open(temp_file, 'rb') as temp:
-                    key_data = temp.read()
-                    f.write(struct.pack('<I', len(key_data)))
-                    f.write(key_data)
-            finally:
-                # Clean up the temporary file
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
+        pickle.dump((headers, removed_values_list), f)
+    
+    print(f"Encryption complete. Encrypted {len(sequences)} sequences.")
 
 def decrypt_fasta(input_spd: str, input_key: str, output_fasta: str, parallel: bool = True, num_processes: int = None) -> None:
     """
-    Decrypt an SPD file to FASTA format using the key file.
+    Decrypt a file encrypted with secure self-power decomposition back to FASTA format.
     
     Args:
-        input_spd: Path to input SPD file
+        input_spd: Path to input encrypted file
         input_key: Path to input key file
         output_fasta: Path to output FASTA file
-        parallel: Whether to use parallel processing for multiple sequences
-        num_processes: Number of processes to use (defaults to number of CPU cores)
+        parallel: Whether to use parallel processing for large sequences
+        num_processes: Number of processes to use for parallel processing
     """
-    # Read encrypted data from SPD file
+    print(f"Reading encrypted data from: {input_spd}")
     with open(input_spd, 'rb') as f:
-        # Read header
-        magic = f.read(8)
-        if magic != b'DNASP001':
-            raise ValueError("Invalid SPD file format")
-        
+        # Read the number of sequences
         num_sequences = struct.unpack('<I', f.read(4))[0]
         
-        # Read sequence data
-        seq_ids = []
-        seq_descriptions = []
-        seq_lengths = []
-        encrypted_data = []
+        # Read each header and encrypted data
+        headers = []
+        encrypted_data_list = []
         
         for _ in range(num_sequences):
-            # Read sequence ID and description
-            id_len = struct.unpack('<I', f.read(4))[0]
-            id_bytes = f.read(id_len)
+            # Read the header length and header
+            header_length = struct.unpack('<I', f.read(4))[0]
+            header = f.read(header_length).decode('utf-8')
+            headers.append(header)
             
-            desc_len = struct.unpack('<I', f.read(4))[0]
-            desc_bytes = f.read(desc_len)
-            
-            seq_ids.append(id_bytes.decode('utf-8'))
-            seq_descriptions.append(desc_bytes.decode('utf-8'))
-            
-            # Read sequence length
-            seq_len = struct.unpack('<I', f.read(4))[0]
-            seq_lengths.append(seq_len)
-            
-            # Read encrypted data
-            data_len = struct.unpack('<I', f.read(4))[0]
-            data = f.read(data_len)
-            encrypted_data.append(data)
+            # Read the encrypted data length and data
+            data_length = struct.unpack('<I', f.read(4))[0]
+            encrypted_data = f.read(data_length)
+            encrypted_data_list.append(encrypted_data)
     
-    # Read key data from key file
+    print(f"Reading encryption key from: {input_key}")
     with open(input_key, 'rb') as f:
-        # Read header
-        magic = f.read(8)
-        if magic != b'DNAKY001':
-            raise ValueError("Invalid key file format")
-        
-        key_num_sequences = struct.unpack('<I', f.read(4))[0]
-        if key_num_sequences != num_sequences:
-            raise ValueError("Key file does not match SPD file")
-        
-        # Read removed values for each sequence
-        all_removed_values = []
-        
-        for _ in range(num_sequences):
-            # Read sequence ID
-            id_len = struct.unpack('<I', f.read(4))[0]
-            id_bytes = f.read(id_len)
-            
-            # Create a temporary file for the removed values
-            fd, temp_file = tempfile.mkstemp(suffix='.tmp')
-            os.close(fd)
-            
-            try:
-                # Read key data length
-                key_data_len = struct.unpack('<I', f.read(4))[0]
-                key_data = f.read(key_data_len)
-                
-                # Write key data to temporary file
-                with open(temp_file, 'wb') as temp:
-                    temp.write(key_data)
-                
-                # Check if this is a chunked sequence
-                with open(temp_file, 'rb') as temp:
-                    magic_check = temp.read(8)
-                    if magic_check == b'CHUNK001':
-                        # This is a chunked sequence
-                        chunk_keys = []
-                        
-                        # Read the number of chunks
-                        with open(temp_file, 'rb') as temp:
-                            temp.seek(8)  # Skip the magic number
-                            num_chunks = struct.unpack('<I', temp.read(4))[0]
-                            
-                            # Read each chunk's key
-                            for _ in range(num_chunks):
-                                # Read chunk index
-                                chunk_idx = struct.unpack('<I', temp.read(4))[0]
-                                
-                                # Read chunk key data
-                                chunk_key_len = struct.unpack('<I', temp.read(4))[0]
-                                chunk_key_data = temp.read(chunk_key_len)
-                                
-                                # Create a temporary file for the chunk key
-                                fd_chunk, chunk_temp_file = tempfile.mkstemp(suffix='.tmp')
-                                os.close(fd_chunk)
-                                
-                                try:
-                                    # Write chunk key data to temporary file
-                                    with open(chunk_temp_file, 'wb') as chunk_temp:
-                                        chunk_temp.write(chunk_key_data)
-                                    
-                                    # Load chunk key from temporary file
-                                    chunk_key = load_removed_info_no_placeholder(chunk_temp_file)
-                                    chunk_keys.append((chunk_idx, chunk_key))
-                                finally:
-                                    # Clean up the chunk temporary file
-                                    if os.path.exists(chunk_temp_file):
-                                        os.remove(chunk_temp_file)
-                        
-                        all_removed_values.append(chunk_keys)
-                    else:
-                        # This is a regular sequence
-                        removed_values = load_removed_info_no_placeholder(temp_file)
-                        all_removed_values.append(removed_values)
-            finally:
-                # Clean up the temporary file
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
+        key_headers, removed_values_list = pickle.load(f)
     
-    # Decrypt sequences
-    # Use parallel processing if enabled and there are multiple sequences
-    if parallel and num_sequences > 1:
-        # Determine number of processes
-        if num_processes is None:
-            num_processes = min(multiprocessing.cpu_count(), num_sequences)
-        
-        print(f"Using {num_processes} processes to decrypt {num_sequences} sequences")
-        
-        # Prepare arguments for each sequence
-        args = [(encrypted_data[i], all_removed_values[i], seq_lengths[i]) for i in range(num_sequences)]
-        
-        # Process sequences in parallel
-        with multiprocessing.Pool(processes=num_processes) as pool:
-            decrypted_sequences = pool.map(_decrypt_sequence_worker, args)
-    else:
-        # Sequential processing
-        decrypted_sequences = []
-        for i in range(num_sequences):
-            sequence = decrypt_sequence(encrypted_data[i], all_removed_values[i], seq_lengths[i])
-            decrypted_sequences.append(sequence)
+    # Verify that the headers match
+    if headers != key_headers:
+        print("Warning: Headers in encrypted file do not match headers in key file")
     
-    # Write decrypted sequences to FASTA file
+    print(f"Found {len(headers)} encrypted sequences")
+    
+    # Decrypt each sequence
+    decrypted_sequences = []
+    
+    for i, (header, encrypted_data, removed_values) in enumerate(zip(headers, encrypted_data_list, removed_values_list)):
+        print(f"Decrypting sequence {i+1}/{len(headers)}: {header}")
+        
+        # Check if this is a chunked sequence
+        is_chunked = (len(encrypted_data) >= 4 and 
+                     isinstance(removed_values, list) and 
+                     len(removed_values) > 0 and 
+                     isinstance(removed_values[0], tuple) and 
+                     len(removed_values[0]) == 2 and 
+                     isinstance(removed_values[0][0], int))
+        
+        # Decrypt the sequence
+        if is_chunked and parallel:
+            # Check if the first element of the tuple is a length (for the new format)
+            # or an index (for the old format)
+            if isinstance(removed_values[0][1], list):
+                decrypted_sequence = decrypt_large_sequence(encrypted_data, removed_values)
+            else:
+                # This is the old format where the first element is an index
+                decrypted_sequence = decrypt_sequence(encrypted_data, removed_values)
+        else:
+            decrypted_sequence = decrypt_sequence(encrypted_data, removed_values)
+        
+        decrypted_sequences.append(decrypted_sequence)
+    
+    # Save the decrypted sequences to FASTA format
+    print(f"Saving decrypted sequences to: {output_fasta}")
     with open(output_fasta, 'w') as f:
-        for i in range(num_sequences):
-            f.write(f">{seq_descriptions[i]}\n")
+        for header, sequence in zip(headers, decrypted_sequences):
+            f.write(f">{header}\n")
             
-            # Write sequence with line wrapping at 60 characters
-            seq = decrypted_sequences[i]
-            for j in range(0, len(seq), 60):
-                f.write(seq[j:j+60] + "\n")
+            # Write the sequence in lines of 70 characters
+            for i in range(0, len(sequence), 70):
+                f.write(f"{sequence[i:i+70]}\n")
+    
+    print(f"Decryption complete. Decrypted {len(headers)} sequences.")
+
+def encrypt_sequence_optimized(sequence: str, num_removed: int = DEFAULT_SECURITY_LEVEL, chunk_size: int = DEFAULT_CHUNK_SIZE) -> Tuple[bytes, List[Tuple[int, int]]]:
+    """
+    Optimized version of encrypt_sequence using direct number conversion.
+    
+    Args:
+        sequence: DNA sequence string
+        num_removed: Number of values to remove for the key
+        chunk_size: Maximum size of each chunk for large sequences
+        
+    Returns:
+        Tuple of (encrypted data, removed values)
+    """
+    # Special case for empty sequences
+    if not sequence:
+        # Return a special marker for empty sequences
+        return b'\x02', [(0, 0)]  # Flag 2 for empty sequence
+    
+    # Check if sequence is too large and needs chunking
+    if len(sequence) > chunk_size:
+        print(f"Sequence length ({len(sequence):,} bases) exceeds chunk size ({chunk_size:,} bases), using optimized chunking...")
+        return encrypt_large_sequence_optimized(sequence, num_removed, chunk_size)
+    
+    # Convert DNA to number
+    print(f"Converting DNA sequence ({len(sequence):,} bases) to number...")
+    number = dna_to_number(sequence)
+    
+    # Encrypt using secure self-power decomposition
+    print(f"Encrypting number using secure self-power decomposition...")
+    encoded_data, removed_values = secure_encode_number_no_placeholder(number, num_removed)
+    print(f"Encryption complete. Data size: {len(encoded_data):,} bytes")
+    
+    return encoded_data, removed_values
+
+def decrypt_sequence_optimized(encoded_data: bytes, removed_values: List[Tuple[int, int]], expected_length: int = None) -> str:
+    """
+    Optimized version of decrypt_sequence using direct number conversion.
+    
+    Args:
+        encoded_data: Encrypted sequence data
+        removed_values: List of removed values (positions and values) or chunked keys
+        expected_length: Expected length of the original sequence
+        
+    Returns:
+        Decrypted DNA sequence
+    """
+    # Special case for empty sequences
+    if encoded_data == b'\x02' and removed_values == [(0, 0)]:
+        return ""
+    
+    # Check if this is a chunked sequence
+    if len(encoded_data) >= 4 and isinstance(removed_values, list) and len(removed_values) > 0 and isinstance(removed_values[0], tuple) and len(removed_values[0]) == 2 and isinstance(removed_values[0][0], int) and isinstance(removed_values[0][1], list):
+        print(f"Detected chunked sequence, using optimized chunking for decryption...")
+        return decrypt_large_sequence_optimized(encoded_data, removed_values, expected_length)
+    
+    # Decrypt using secure self-power decomposition
+    print(f"Decrypting data ({len(encoded_data):,} bytes) using secure self-power decomposition...")
+    number = secure_decode_number_no_placeholder(encoded_data, removed_values)
+    
+    # Convert number back to DNA
+    print(f"Converting number back to DNA sequence...")
+    sequence = number_to_dna(number, expected_length)
+    print(f"Decryption complete. Recovered sequence length: {len(sequence):,} bases")
+    
+    return sequence

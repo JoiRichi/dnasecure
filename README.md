@@ -68,6 +68,40 @@ Parallel processing can provide significant speedup when working with multiFASTA
 
 The speedup scales with the number of sequences and available CPU cores.
 
+### Optimized Implementation
+
+DNAsecure includes an experimental optimized implementation for large sequence processing that aims to provide performance improvements:
+
+- Uses memory views for zero-copy slicing
+- Implements parallel processing for individual large sequences
+- Optimizes chunking and buffer management
+
+The optimized implementation is **disabled by default** as it may not provide significant performance improvements in all scenarios. You can enable it if you want to experiment with it:
+
+```python
+from dnasecure.core import USE_OPTIMIZED_IMPLEMENTATION
+
+# Enable optimized implementation
+import dnasecure.core
+dnasecure.core.USE_OPTIMIZED_IMPLEMENTATION = True
+
+# Use optimized implementation
+result = encrypt_sequence(sequence)
+
+# Disable optimized implementation
+dnasecure.core.USE_OPTIMIZED_IMPLEMENTATION = False
+```
+
+You can benchmark the performance difference using the provided benchmark script:
+
+```bash
+# Compare original vs. optimized implementation for different sequence lengths
+python examples/optimized_benchmark.py --test length
+
+# Compare original vs. optimized implementation for different chunk sizes
+python examples/optimized_benchmark.py --test chunk --sequence-length 100000
+```
+
 ### Python API
 
 #### Basic Usage

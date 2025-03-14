@@ -22,4 +22,4 @@ from .core import (
     DEFAULT_CHUNK_SIZE
 )
 
-__version__ = '0.0.2'
+__version__ = '0.0.4'

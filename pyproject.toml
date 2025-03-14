@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dnasecure"
-version = "0.0.3"
+version = "0.0.4"
 authors = [
-    {name = "SelfPower Team", email = "lordrichado@gmail.com"},
+    {name = "Richard Daodu", email = "lordrichado@gmail.com"},
 ]
 description = "DNA sequence encryption and security using self-power decomposition"
 readme = "README.md"
